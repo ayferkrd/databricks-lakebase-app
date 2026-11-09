@@ -12,6 +12,7 @@ Deploy as a Databricks App using app.yaml.
 import logging
 import os
 import re
+from datetime import datetime, timezone
 
 import requests
 from databricks.sdk import WorkspaceClient
@@ -28,6 +29,7 @@ _w = WorkspaceClient()
 
 TABLE_NAME = os.environ.get("MASSIVE_TABLE_NAME", "massive_records")
 WATCHLIST_TABLE_NAME = os.environ.get("WATCHLIST_TABLE_NAME", "watchlist")
+HISTORY_TABLE_NAME = os.environ.get("HISTORY_TABLE_NAME", "price_history")
 
 # Basic stock ticker shape check: 1-10 uppercase letters, with an optional
 # ".X" or ".XX" share-class suffix (e.g. "BRK.B"). This rejects obviously
@@ -58,6 +60,24 @@ def ensure_watchlist_table():
             latest_price NUMERIC,
             updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
             PRIMARY KEY (symbol, email)
+        )
+        """
+    )
+
+
+def ensure_history_table():
+    """Create the price-history table in Lakebase if it doesn't exist yet."""
+    lakebase.run_write(
+        f"""
+        CREATE TABLE IF NOT EXISTS {HISTORY_TABLE_NAME} (
+            symbol TEXT NOT NULL,
+            bar_date DATE NOT NULL,
+            open NUMERIC,
+            high NUMERIC,
+            low NUMERIC,
+            close NUMERIC NOT NULL,
+            volume NUMERIC,
+            PRIMARY KEY (symbol, bar_date)
         )
         """
     )
@@ -195,6 +215,91 @@ def add_to_watchlist():
     )
 
     return jsonify({"symbol": symbol, "email": email, "latest_price": price})
+
+
+@app.route("/watchlist/<symbol>", methods=["DELETE"])
+def delete_from_watchlist(symbol):
+    """Remove a symbol from the current user's watchlist in Lakebase."""
+    ensure_watchlist_table()
+
+    symbol = symbol.strip().upper()
+    if not _TICKER_RE.match(symbol):
+        return jsonify({"error": f"Invalid ticker symbol: {symbol!r}"}), 400
+
+    email = _current_user_email()
+    deleted = lakebase.run_write(
+        f"DELETE FROM {WATCHLIST_TABLE_NAME} WHERE symbol = %s AND email = %s",
+        (symbol, email),
+    )
+    if not deleted:
+        return jsonify({"error": f"{symbol} is not on your watchlist"}), 404
+    return jsonify({"symbol": symbol, "deleted": True})
+
+
+@app.route("/history/<symbol>", methods=["GET"])
+def get_price_history(symbol):
+    """
+    Fetch historical daily OHLCV bars for a symbol from Massive in ONE API
+    call (MassiveClient.get_history), upsert them into Lakebase, and return
+    them oldest->newest so the UI can draw a sparkline.
+    """
+    symbol = symbol.strip().upper()
+    if not _TICKER_RE.match(symbol):
+        return jsonify({"error": f"Invalid ticker symbol: {symbol!r}"}), 400
+
+    try:
+        days = int(request.args.get("days", 90))
+    except ValueError:
+        return jsonify({"error": "days must be an integer"}), 400
+    days = min(max(days, 1), 730)
+
+    client = MassiveClient()
+    try:
+        data = client.get_history(symbol, days=days)  # single API call
+    except requests.HTTPError:
+        return jsonify({"error": f"Unknown ticker symbol: {symbol}"}), 400
+
+    results = data.get("results") if isinstance(data, dict) else None
+    bars = []
+    for bar in results or []:
+        if not isinstance(bar, dict) or bar.get("c") is None:
+            continue
+        bars.append(
+            {
+                "date": datetime.fromtimestamp(bar["t"] / 1000, tz=timezone.utc).date().isoformat(),
+                "open": bar.get("o"),
+                "high": bar.get("h"),
+                "low": bar.get("l"),
+                "close": bar["c"],
+                "volume": bar.get("v"),
+            }
+        )
+    bars.sort(key=lambda b: b["date"])
+
+    if bars:
+        ensure_history_table()
+        with lakebase.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.executemany(
+                    f"""
+                    INSERT INTO {HISTORY_TABLE_NAME}
+                        (symbol, bar_date, open, high, low, close, volume)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (symbol, bar_date) DO UPDATE
+                        SET open = EXCLUDED.open,
+                            high = EXCLUDED.high,
+                            low = EXCLUDED.low,
+                            close = EXCLUDED.close,
+                            volume = EXCLUDED.volume
+                    """,
+                    [
+                        (symbol, b["date"], b["open"], b["high"], b["low"], b["close"], b["volume"])
+                        for b in bars
+                    ],
+                )
+            conn.commit()
+
+    return jsonify(bars)
 
 
 def _extract_latest_price(data: dict) -> float | None:

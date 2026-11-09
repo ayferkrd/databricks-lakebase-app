@@ -8,6 +8,7 @@ files, or app.yaml.
 
 import base64
 import os
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import requests
@@ -85,3 +86,23 @@ class MassiveClient:
         """
         data = self.get(f"/v2/aggs/ticker/{symbol}/prev")
         return data
+
+    def get_history(self, symbol: str, days: int = 90, multiplier: int = 1, timespan: str = "day") -> dict:
+        """
+        Fetch daily OHLCV bars for a single symbol over the last `days` days
+        using ONE call to the ranged aggregates endpoint:
+
+            /v2/aggs/ticker/{symbol}/range/{multiplier}/{timespan}/{from}/{to}
+
+        The response shape matches the prev endpoint ("results" is a list of
+        bars, oldest -> newest): {"status": "OK", "resultsCount": N,
+        "results": [{"t": <ms epoch>, "o": open, "h": high, "l": low,
+        "c": close, "v": volume, "vw": volume-weighted price}, ...]}.
+        """
+        to_date = datetime.now(timezone.utc).date()
+        from_date = to_date - timedelta(days=days)
+        path = (
+            f"/v2/aggs/ticker/{symbol}/range/{multiplier}/{timespan}"
+            f"/{from_date.isoformat()}/{to_date.isoformat()}"
+        )
+        return self.get(path)
